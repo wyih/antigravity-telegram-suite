@@ -292,6 +292,8 @@ function killIDE(app = getPreferredApp()) {
                                     `fuser -k ${app === 'ide' ? (process.env.IDE_CDP_PORT || 9334) : (process.env.AGENT_CDP_PORT || process.env.DEBUGGING_PORT || 9333)}/tcp 2>/dev/null || true`
                                 ].join('; ');
                                 exec(cleanupCmd, () => resolve());
+                            } else if (PLATFORM === 'darwin') {
+                                setTimeout(resolve, 800);
                             } else {
                                 resolve();
                             }

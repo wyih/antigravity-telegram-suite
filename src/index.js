@@ -310,9 +310,19 @@ function getCDPPort(app = config.preferredApp || 'agent') {
 }
 let CDP_PORT = getCDPPort();
 
+let _cdpReadyInFlight = null;
+async function ensureAppCdpReady() {
+    if (_cdpReadyInFlight) return _cdpReadyInFlight;
+    const app = config.preferredApp || 'agent';
+    _cdpReadyInFlight = ensureCdpReady({ port: CDP_PORT, app }).finally(() => {
+        _cdpReadyInFlight = null;
+    });
+    return _cdpReadyInFlight;
+}
+
 async function sendViaCDPWithRecovery(text, specificTargetId = null) {
     const app = config.preferredApp || 'agent';
-    await ensureCdpReady({ port: CDP_PORT, app });
+    await ensureAppCdpReady();
     try {
         return await sendViaCDP(text, CDP_PORT, specificTargetId);
     } catch (err) {
@@ -320,7 +330,7 @@ async function sendViaCDPWithRecovery(text, specificTargetId = null) {
             throw err;
         }
         console.warn(`[cdp] Port ${CDP_PORT} refused connection; restarting ${app} with CDP and retrying once.`);
-        await ensureCdpReady({ port: CDP_PORT, app });
+        await ensureAppCdpReady();
         return sendViaCDP(text, CDP_PORT, null);
     }
 }
@@ -1174,6 +1184,7 @@ bot.command('start', async (ctx) => {
 
 const handleLatest = async (ctx) => {
     try {
+        await ensureAppCdpReady();
         // Use the preferred target (set by workspace switch or /window command)
         // instead of blindly picking candidates[0] which may be the wrong window
         const targetId = getPreferredTargetId() || null;
@@ -1194,6 +1205,7 @@ bot.hears(/^💬/i, handleLatest);
 const handleScreenshot = async (ctx) => {
     try {
         setReaction(ctx, REACTION.THINKING);
+        await ensureAppCdpReady();
         const buffer = await captureFullIDEScreenshot(CDP_PORT);
         await ctx.replyWithPhoto({ source: buffer });
         setReaction(ctx, null);
@@ -1208,6 +1220,7 @@ bot.hears(/^📸/i, handleScreenshot);
 bot.command('quota', async (ctx) => {
     try {
         setReaction(ctx, REACTION.THINKING);
+        await ensureAppCdpReady();
         const quotaInfo = await getQuota(CDP_PORT, t);
         if (quotaInfo) {
             ctx.reply(quotaInfo);
@@ -1558,6 +1571,7 @@ bot.action(/^sch_del_(.+)$/, async (ctx) => {
 bot.command('new', async (ctx) => {
     console.log('[/new] Command triggered');
     try {
+        await ensureAppCdpReady();
         const success = await triggerNewChat(CDP_PORT);
         console.log('[/new] triggerNewChat result:', success);
         if (success) {
@@ -1668,6 +1682,7 @@ function renderProjectThreadsKeyboard(ws, wsIdx) {
 }
 
 async function executeAgentThreadSwitch(ctx, thread, isCallback = false) {
+    await ensureAppCdpReady();
     const targetId = await switchAgentThread(CDP_PORT, thread.name, thread.workspace, thread.threadId);
     if (!targetId) {
         const errMsg = t('agents.not_found') || '❌ Thread could not be selected.';
@@ -1696,6 +1711,7 @@ async function executeAgentThreadSwitch(ctx, thread, isCallback = false) {
 }
 
 async function renderAndSendAgentThreads(ctx, port, editMessageId = null) {
+    await ensureAppCdpReady();
     const workspaces = await listAgentThreads(port);
     if (!workspaces || workspaces.length === 0) {
         if (editMessageId) {
@@ -1751,7 +1767,7 @@ bot.command('agents', async (ctx) => {
         try {
             await renderAndSendAgentThreads(ctx, CDP_PORT);
         } catch (e) {
-            ctx.reply((t('agents.error') || '❌ Error: ') + e.message);
+            ctx.reply(t('agents.error', { error: e.message }) || `❌ Error: ${e.message}`);
         }
         return;
     }
@@ -1770,6 +1786,7 @@ bot.command('agents', async (ctx) => {
 
     // 3. Keyword Search (e.g. /agents dertli or /agents model)
     if (cachedAgentThreads.length === 0) {
+        await ensureAppCdpReady().catch(() => {});
         await listAgentThreads(CDP_PORT).then(workspaces => {
             cachedWorkspacesList = workspaces;
             cachedAgentThreads = [];
@@ -2424,7 +2441,10 @@ const handleArtifacts = async (ctx) => {
 
         // Try to get the active thread info for workspace filtering
         let threadInfo = null;
-        try { threadInfo = await getActiveThreadInfo(CDP_PORT, getPreferredTargetId()); } catch (_) {}
+        try {
+            await ensureAppCdpReady();
+            threadInfo = await getActiveThreadInfo(CDP_PORT, getPreferredTargetId());
+        } catch (_) {}
         const workspaceName = threadInfo?.workspace?.split(' - ')?.[0]?.trim()?.toLowerCase() || null;
         
         // Strategy: Try known thread ID first, then active thread from DOM, then scan all conversations
@@ -2612,7 +2632,7 @@ const handleArtifacts = async (ctx) => {
             await ctx.reply(m, { parse_mode: 'HTML' });
         }
     } catch (e) {
-        ctx.reply((t('artifacts.error') || '❌ Error reading artifact: ') + e.message);
+        ctx.reply(t('artifacts.error', { error: e.message }) || `❌ Error reading artifact: ${e.message}`);
     }
 };
 
@@ -2638,7 +2658,7 @@ bot.hears(/^\/artifact_(\d+)$/, async (ctx) => {
                 await ctx.replyWithDocument({ source: artifact.path });
             }
         } catch (e) {
-            ctx.reply((t('artifacts.error') || '❌ Error: ') + e.message);
+            ctx.reply(t('artifacts.error', { error: e.message }) || `❌ Error: ${e.message}`);
         }
     } else {
         ctx.reply(t('artifacts.invalid_number') || '❌ Invalid artifact number.');
@@ -3035,12 +3055,14 @@ let cachedModelsList = [];
 async function ensureModelsCache() {
     if (!cachedModelsList || cachedModelsList.length === 0) {
         try {
+            await ensureAppCdpReady();
             cachedModelsList = await getAvailableModels(CDP_PORT);
         } catch (e) {
             console.error('Failed to get dynamic models:', e.message);
         }
         if (!cachedModelsList || cachedModelsList.length === 0) {
             cachedModelsList = [
+                { name: 'Gemini 4 Carbon', baseName: 'Gemini 4 Carbon', hasTiers: true, tiers: ['Low', 'Medium', 'High'], currentTier: 'Medium' },
                 { name: 'Gemini 4 Argon', baseName: 'Gemini 4 Argon', hasTiers: true, tiers: ['Low', 'Medium', 'High'], currentTier: 'High' },
                 { name: 'Gemini 3.8 Flash', baseName: 'Gemini 3.8 Flash', hasTiers: true, tiers: ['Low', 'Medium', 'High'], currentTier: 'Medium' },
                 { name: 'Claude Opus 5.5', baseName: 'Claude Opus 5.5', hasTiers: true, tiers: ['Low', 'Medium', 'High'], currentTier: 'High' },
@@ -3080,6 +3102,7 @@ const handleModel = async (ctx) => {
     if (modelName) {
         try {
             setReaction(ctx, REACTION.THINKING);
+            await ensureAppCdpReady();
             const success = await selectModel(CDP_PORT, modelName);
             if (success) ctx.reply(t('model.changed', { model: modelName }));
             else ctx.reply(t('model.not_found'));
@@ -3091,8 +3114,11 @@ const handleModel = async (ctx) => {
     
     // Refresh models dynamically
     try {
+        await ensureAppCdpReady();
         cachedModelsList = await getAvailableModels(CDP_PORT);
-    } catch (_) {}
+    } catch (e) {
+        console.error('Failed to refresh dynamic models:', e.message);
+    }
     const models = await ensureModelsCache();
     const buttons = buildModelListButtons(models);
     
@@ -3125,9 +3151,15 @@ bot.action(/md_tier_(\d+)/, async (ctx) => {
             return { text: `${tierEmoji} ${tier}`, callback_data: `md_sel_${idx}_${tier}` };
         });
         tierButtons.push(tiersRow);
-        tierButtons.push([{ text: '🔙 Model Listesi', callback_data: 'md_back' }]);
+        const lang = getLang();
+        const backLabel = lang === 'zh' ? '🔙 返回模型列表' : (lang === 'tr' ? '🔙 Model Listesi' : '🔙 Back to Models');
+        tierButtons.push([{ text: backLabel, callback_data: 'md_back' }]);
 
-        const text = `🤖 <b>${escapeHtml(cleanName)}</b> için düşünme seviyesini (effort tier) seçin:`;
+        const text = lang === 'zh'
+            ? `🤖 请选择 <b>${escapeHtml(cleanName)}</b> 的思考强度：`
+            : (lang === 'tr'
+                ? `🤖 <b>${escapeHtml(cleanName)}</b> için düşünme seviyesini (effort tier) seçin:`
+                : `🤖 Select effort tier for <b>${escapeHtml(cleanName)}</b>:`);
         if (ctx.callbackQuery && ctx.callbackQuery.message) {
             await ctx.editMessageText(text, {
                 parse_mode: 'HTML',
@@ -3183,6 +3215,7 @@ bot.action(/md_sel_(\d+)_(.+)/, async (ctx) => {
             await ctx.reply(changingText);
         }
         
+        await ensureAppCdpReady();
         const success = await selectModel(CDP_PORT, fullModelName);
         if (success) {
             await sendMainMenu(ctx, t('model.changed', { model: fullModelName }));
@@ -3210,6 +3243,7 @@ bot.action(/md_direct_(\d+)/, async (ctx) => {
             await ctx.reply(changingText);
         }
         
+        await ensureAppCdpReady();
         const success = await selectModel(CDP_PORT, modelName);
         if (success) {
             await sendMainMenu(ctx, t('model.changed', { model: modelName }));
@@ -3233,6 +3267,7 @@ bot.action(/md_(.+)/, async (ctx) => {
         } else {
             await ctx.reply(changingText);
         }
+        await ensureAppCdpReady();
         const success = await selectModel(CDP_PORT, modelName);
         if (success) await sendMainMenu(ctx, t('model.changed', { model: modelName }));
         else ctx.reply(t('model.select_failed'));
@@ -4021,6 +4056,7 @@ if (Test-Path $lnkIDE) {
 
 bot.command('window', async (ctx) => {
     try {
+        await ensureAppCdpReady();
         const windows = await listWindows(CDP_PORT);
         if (windows.length === 0) {
             return ctx.reply(t('window.not_found') || 'No IDE windows found. Send /start_ide first.');
@@ -4549,6 +4585,7 @@ async function handlePermissionMode(ctx) {
 
     if (arg && ['turbo', 'auto', 'default', 'review', 'request_review'].includes(arg)) {
         try {
+            await ensureAppCdpReady();
             const res = await selectPermissionMode(CDP_PORT, arg);
             if (res.ok && res.mode) {
                 return await sendMainMenu(ctx, `✅ <b>Permission Mode:</b> ${res.mode.shortLabel}`);
@@ -4560,6 +4597,7 @@ async function handlePermissionMode(ctx) {
     }
 
     try {
+        await ensureAppCdpReady();
         const current = await getCurrentPermissionMode(CDP_PORT);
         const currentId = current?.id || 'turbo';
         const currentLabel = current?.shortLabel || '🚀 Turbo';
@@ -4588,6 +4626,7 @@ bot.action(/^perm_mode_(.+)$/, async (ctx) => {
     const modeKey = ctx.match[1];
     try {
         await ctx.answerCbQuery(`Switching to ${modeKey}...`);
+        await ensureAppCdpReady();
         const res = await selectPermissionMode(CDP_PORT, modeKey);
         if (res.ok && res.mode) {
             const updatedMsg =
@@ -4628,7 +4667,7 @@ bot.hears(/^🤖/i, async (ctx) => {
     try {
         await renderAndSendAgentThreads(ctx, CDP_PORT);
     } catch (e) {
-        ctx.reply((t('agents.error') || '❌ Error: ') + e.message);
+        ctx.reply(t('agents.error', { error: e.message }) || `❌ Error: ${e.message}`);
     }
 });
 bot.hears(/^🧠/i, handleModel);

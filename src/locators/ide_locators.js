@@ -299,7 +299,7 @@ const IDE_LOCATORS_SCRIPT = `
 
             if (validExplicit.length > 0) return validExplicit[0];
 
-            const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash', 'llama', 'mistral', 'deepseek'];
+            const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash', 'argon', 'carbon', 'llama', 'mistral', 'deepseek'];
             const allButtons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(el => {
                 if (!AG_UI.isVisible(el)) return false;
                 if (el.closest('.monaco-tree-view, .explorer-viewlet, .tabs-container, .monaco-editor, .monaco-list, .monaco-list-rows')) return false;
@@ -323,7 +323,7 @@ const IDE_LOCATORS_SCRIPT = `
 
         getModelOptions: () => {
             const isFile = (str) => /\.(js|jsx|ts|tsx|md|json|py|html|css|txt|sh)$/i.test((str || '').trim());
-            const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash', 'llama', 'mistral', 'deepseek'];
+            const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash', 'argon', 'carbon', 'llama', 'mistral', 'deepseek'];
             
             const selectorBtn = AG_UI.getModelSelectorButton();
             const ariaControlsId = selectorBtn ? selectorBtn.getAttribute('aria-controls') : null;
