@@ -472,8 +472,13 @@ function getChatExtractExpr() {
                             }
                         });
                         
-                        let userNodes = Array.from(clone.querySelectorAll('[role="article"][aria-label="User message"], [aria-label*="User message"], .bg-input, [data-message-author="user"], [class*="group/user-input-step"], .interactive-request, .chat-request'));
-                        if (userNodes.length === 0 && ((clone.getAttribute && (clone.getAttribute('aria-label') === 'User message' || clone.getAttribute('data-message-author') === 'user')) || (clone.className && (clone.className.includes('user-message') || clone.className.includes('interactive-request') || clone.className.includes('chat-request') || clone.className.includes('user-input') || (clone.className.includes('rounded-xl') && clone.className.includes('bg-card-border') && !clone.className.includes('rounded-2xl')))))) {
+                        Array.from(clone.querySelectorAll('.sr-only')).forEach(el => el.remove());
+
+                        let userNodes = Array.from(clone.querySelectorAll('[data-testid="user-message-content"], [data-testid="user-message"], [role="article"][aria-label="User message"], [aria-label*="User message"], .bg-input, [data-message-author="user"], [class*="group/user-input-step"], .interactive-request, .chat-request'));
+                        if (userNodes.length > 1) {
+                            userNodes = userNodes.filter(el => !userNodes.some(other => other !== el && other.contains(el)));
+                        }
+                        if (userNodes.length === 0 && ((clone.getAttribute && (clone.getAttribute('aria-label') === 'User message' || clone.getAttribute('data-message-author') === 'user' || clone.getAttribute('data-testid') === 'user-message')) || (clone.className && (clone.className.includes('user-message') || clone.className.includes('interactive-request') || clone.className.includes('chat-request') || clone.className.includes('user-input') || (clone.className.includes('rounded-xl') && clone.className.includes('bg-card-border') && !clone.className.includes('rounded-2xl')))))) {
                             userNodes = [clone];
                         }
                         
@@ -489,7 +494,7 @@ function getChatExtractExpr() {
                             
                             if (!isEntireRowUser) {
                                 // First try: look for a dedicated agent response article element
-                                const agentArticle = clone.querySelector('[role="article"][aria-label="Agent response"], [data-message-author="agent"], [data-message-author="assistant"]');
+                                const agentArticle = clone.querySelector('[data-testid="agent-response"], [role="article"][aria-label="Agent response"], [data-message-author="agent"], [data-message-author="assistant"]');
                                 if (agentArticle) {
                                     // Remove model selectors, thought/tool headers, status spinners
                                     Array.from(agentArticle.querySelectorAll('style, svg, [data-testid*="worked-for"], [data-testid*="thought"], [data-testid*="model"], [class*="animate-spin"]')).forEach(el => el.remove());
@@ -3136,7 +3141,12 @@ module.exports = {
     switchStandaloneWorkspace,
     listStandaloneWorkspaces,
     getLastResolvedThreadId, setLastResolvedThreadId,
-    setOnThreadResolved
+    setOnThreadResolved,
+    getTranscriptPath,
+    getTranscriptSize,
+    resolveActiveConversationAfterSend,
+    waitForConversationResponse,
+    getConversationLatestResponse
 };
 
 async function captureFullIDEScreenshot(port) {
@@ -3811,4 +3821,331 @@ async function closeAllEditors(port) {
     });
     await client.close();
     return count?.result?.value || 0;
+}
+
+function getTranscriptPath(conversationId) {
+    if (!conversationId) return null;
+    const appDataName = DriverFactory.getDriver().appDataName;
+    const logsDir = path.join(os.homedir(), '.gemini', appDataName, 'brain', conversationId, '.system_generated', 'logs');
+    const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+    if (fs.existsSync(fullPath)) return fullPath;
+    const compactPath = path.join(logsDir, 'transcript.jsonl');
+    if (fs.existsSync(compactPath)) return compactPath;
+    return null;
+}
+
+function getTranscriptSize(conversationId) {
+    const tPath = getTranscriptPath(conversationId);
+    if (!tPath) return 0;
+    try {
+        return fs.statSync(tPath).size;
+    } catch (_) {
+        return 0;
+    }
+}
+
+function _cleanTranscriptModelText(raw, includeThoughts = false) {
+    if (!raw) return '';
+    let c = String(raw);
+    if (!includeThoughts) {
+        c = c.replace(/<thought>[\s\S]*?<\/thought>\n?/g, '');
+    }
+    return c.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function resolveActiveConversationAfterSend(port, specificTargetId = null, options = {}) {
+    const { excludeConversationId = null, sinceMs = Date.now() - 2000, waitMs = 6000 } = options;
+    const deadline = Date.now() + waitMs;
+
+    while (Date.now() < deadline) {
+        try {
+            const info = await getActiveThreadInfo(port, specificTargetId);
+            if (info && info.id && (!excludeConversationId || info.id !== excludeConversationId)) {
+                lastResolvedThreadId = info.id;
+                _notifyThreadResolved(info.id);
+                return {
+                    conversationId: info.id,
+                    title: info.name || '',
+                    workspace: info.workspace || '',
+                    targetId: specificTargetId
+                };
+            }
+        } catch (_) {}
+
+        try {
+            const appDataName = DriverFactory.getDriver().appDataName;
+            const brainDir = path.join(os.homedir(), '.gemini', appDataName, 'brain');
+            if (fs.existsSync(brainDir)) {
+                let newest = null;
+                for (const d of fs.readdirSync(brainDir, { withFileTypes: true })) {
+                    if (!d.isDirectory() || d.name.length < 30) continue;
+                    if (excludeConversationId && d.name === excludeConversationId) continue;
+                    const tPath = getTranscriptPath(d.name);
+                    if (!tPath) continue;
+                    try {
+                        const st = fs.statSync(tPath);
+                        if (st.mtimeMs >= sinceMs && (!newest || st.mtimeMs > newest.mtimeMs)) {
+                            newest = { id: d.name, mtimeMs: st.mtimeMs };
+                        }
+                    } catch (_) {}
+                }
+                if (newest) {
+                    lastResolvedThreadId = newest.id;
+                    _notifyThreadResolved(newest.id);
+                    const info = await getActiveThreadInfo(port, specificTargetId).catch(() => null);
+                    return {
+                        conversationId: newest.id,
+                        title: (info && info.id === newest.id ? info.name : '') || '',
+                        workspace: (info && info.id === newest.id ? info.workspace : '') || '',
+                        targetId: specificTargetId
+                    };
+                }
+            }
+        } catch (_) {}
+
+        await new Promise(r => setTimeout(r, 400));
+    }
+
+    const fallbackInfo = await getActiveThreadInfo(port, specificTargetId).catch(() => null);
+    if (fallbackInfo?.id && (!excludeConversationId || fallbackInfo.id !== excludeConversationId)) {
+        return {
+            conversationId: fallbackInfo.id,
+            title: fallbackInfo.name || '',
+            workspace: fallbackInfo.workspace || '',
+            targetId: specificTargetId
+        };
+    }
+    return null;
+}
+
+async function waitForConversationResponse(port, conversationId, timeoutMs = 450000, onProgress = null, specificTargetId = null, baselineBytes = 0) {
+    if (!conversationId) {
+        const done = await waitForAgentResponse(port, timeoutMs, onProgress, specificTargetId);
+        return { done, finalText: null, emittedProgress: false };
+    }
+
+    const startTime = Date.now();
+    let lastTypingTime = 0;
+    let finalDoneCount = 0;
+    let lastObservedSize = baselineBytes || 0;
+    const emittedSteps = new Set();
+    let emittedAnyProgress = false;
+
+    while (Date.now() - startTime < timeoutMs) {
+        const elapsed = Date.now() - startTime;
+        if (onProgress && elapsed - lastTypingTime >= 4000) {
+            lastTypingTime = elapsed;
+            try { onProgress('typing'); } catch (_) {}
+        }
+
+        const tPath = getTranscriptPath(conversationId);
+        if (!tPath) {
+            if (elapsed > 8000) {
+                console.log(`[waitForConversation] No transcript for ${conversationId.substring(0, 8)} after 8s — falling back to DOM wait`);
+                const done = await waitForAgentResponse(port, Math.max(5000, timeoutMs - elapsed), onProgress, specificTargetId);
+                return { done, finalText: null, emittedProgress: emittedAnyProgress };
+            }
+            await new Promise(r => setTimeout(r, 1000));
+            continue;
+        }
+
+        try {
+            const stats = fs.statSync(tPath);
+            if (stats.size > baselineBytes) {
+                const readLen = stats.size - baselineBytes;
+                const fd = fs.openSync(tPath, 'r');
+                const buf = Buffer.alloc(readLen);
+                fs.readSync(fd, buf, 0, readLen, baselineBytes);
+                fs.closeSync(fd);
+
+                const rawChunk = buf.toString('utf8');
+                const lastNewline = rawChunk.lastIndexOf('\n');
+                const completeChunk = lastNewline >= 0 ? rawChunk.slice(0, lastNewline + 1) : rawChunk;
+                const lines = completeChunk.split('\n').filter(l => l.trim());
+
+                const parsedEntries = [];
+                for (const line of lines) {
+                    try {
+                        parsedEntries.push(JSON.parse(line));
+                    } catch (_) {}
+                }
+
+                // Emit intermediate progress messages (PLANNER_RESPONSE with tool_calls > 0)
+                for (const entry of parsedEntries) {
+                    if (
+                        entry.source === 'MODEL' &&
+                        entry.type === 'PLANNER_RESPONSE' &&
+                        entry.status === 'DONE' &&
+                        Array.isArray(entry.tool_calls) &&
+                        entry.tool_calls.length > 0
+                    ) {
+                        const isAskQuestion = entry.tool_calls.some(tc => (tc.name || tc.tool_name) === 'ask_question');
+                        if (!isAskQuestion) {
+                            const stepKey = entry.step_index !== undefined ? entry.step_index : entry.created_at;
+                            const cleaned = _cleanTranscriptModelText(entry.content, false);
+                            if (cleaned && stepKey !== undefined && !emittedSteps.has(stepKey)) {
+                                emittedSteps.add(stepKey);
+                                emittedAnyProgress = true;
+                                if (onProgress) {
+                                    try { onProgress({ type: 'progress', text: cleaned, stepIndex: stepKey }); } catch (_) {}
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (parsedEntries.length > 0) {
+                    const lastEntry = parsedEntries[parsedEntries.length - 1];
+                    const toolCalls = Array.isArray(lastEntry.tool_calls) ? lastEntry.tool_calls : [];
+                    const hasAskQuestion = toolCalls.some(tc => (tc.name || tc.tool_name) === 'ask_question');
+                    const isFeedbackWrite =
+                        lastEntry.source === 'MODEL' &&
+                        (lastEntry.type === 'WRITE_TO_FILE' || lastEntry.type === 'MULTI_REPLACE_FILE_CONTENT' || lastEntry.type === 'REPLACE_FILE_CONTENT') &&
+                        lastEntry.status === 'DONE' &&
+                        typeof lastEntry.content === 'string' &&
+                        lastEntry.content.includes('requested user feedback');
+
+                    if (hasAskQuestion || isFeedbackWrite) {
+                        await new Promise(r => setTimeout(r, 800));
+                        return {
+                            done: true,
+                            finalText: _cleanTranscriptModelText(lastEntry.content, false),
+                            emittedProgress: emittedAnyProgress
+                        };
+                    }
+
+                    const isFinalPlannerResponse =
+                        lastEntry.source === 'MODEL' &&
+                        lastEntry.type === 'PLANNER_RESPONSE' &&
+                        lastEntry.status === 'DONE' &&
+                        toolCalls.length === 0;
+
+                    if (isFinalPlannerResponse) {
+                        if (stats.size === lastObservedSize) {
+                            finalDoneCount++;
+                        } else {
+                            finalDoneCount = 1;
+                        }
+                        lastObservedSize = stats.size;
+                        if (finalDoneCount >= 2) {
+                            return {
+                                done: true,
+                                finalText: _cleanTranscriptModelText(lastEntry.content, false),
+                                emittedProgress: emittedAnyProgress
+                            };
+                        }
+                    } else {
+                        finalDoneCount = 0;
+                        lastObservedSize = stats.size;
+                    }
+                }
+            } else if (elapsed > 15000) {
+                // If transcript hasn't grown at all after 15s, check if an interactive modal blocked submission on this conversation
+                try {
+                    const activeId = await getActiveThreadId(port, specificTargetId);
+                    if (activeId === conversationId) {
+                        const modal = await getInteractiveModalState(port, specificTargetId);
+                        if (modal) {
+                            return { done: true, finalText: '', emittedProgress: emittedAnyProgress };
+                        }
+                    }
+                } catch (_) {}
+            }
+        } catch (err) {
+            console.debug(`[waitForConversation] Read error (${conversationId.substring(0, 8)}): ${err.message}`);
+        }
+
+        await new Promise(r => setTimeout(r, 1200));
+    }
+
+    return { done: false, finalText: null, emittedProgress: emittedAnyProgress };
+}
+
+async function getConversationLatestResponse(port, conversationId, specificTargetId = null, threadName = null, includeThoughts = false, onlyFinalStep = false) {
+    if (!conversationId) {
+        return getFullLatestResponse(port, specificTargetId, threadName, includeThoughts);
+    }
+
+    const targetIdToUse = specificTargetId || preferredTargetId;
+    let modalText = '';
+    let modalButtons = null;
+
+    // Only inspect DOM modal if the UI is currently displaying this exact conversation
+    try {
+        const activeUiId = await getActiveThreadId(port, targetIdToUse);
+        if (activeUiId === conversationId) {
+            const modalState = await getInteractiveModalState(port, targetIdToUse);
+            if (modalState) {
+                modalText = `\n\n❓ <b>${escHtml(modalState.header || 'Question')}</b>\n`;
+                if (modalState.options && modalState.options.length > 0) {
+                    modalText += `\n${t('interactive_modal.options_prompt')}`;
+                    modalButtons = {
+                        reply_markup: {
+                            inline_keyboard: modalState.options.map((opt, i) => ([{ text: `${i + 1}️⃣ ${opt}`, callback_data: `ans_${i + 1}` }]))
+                        }
+                    };
+                } else {
+                    modalText += `\n${t('interactive_modal.confirm_prompt')}`;
+                    modalButtons = {
+                        reply_markup: {
+                            inline_keyboard: [[{ text: t('interactive_modal.btn_confirm'), callback_data: 'ans_Onayla' }, { text: t('interactive_modal.btn_reject'), callback_data: 'ans_Reddet' }]]
+                        }
+                    };
+                }
+            }
+        }
+    } catch (_) {}
+
+    const tPath = getTranscriptPath(conversationId);
+    if (tPath) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const stats = fs.statSync(tPath);
+                const readSize = Math.min(250000, stats.size);
+                const fd = fs.openSync(tPath, 'r');
+                const buf = Buffer.alloc(readSize);
+                fs.readSync(fd, buf, 0, readSize, Math.max(0, stats.size - readSize));
+                fs.closeSync(fd);
+
+                const lines = buf.toString('utf8').split('\n').filter(l => l.trim());
+                const modelMsgs = [];
+                for (let i = lines.length - 1; i >= 0; i--) {
+                    try {
+                        const entry = JSON.parse(lines[i]);
+                        if (entry.source === 'USER_EXPLICIT' && entry.content) {
+                            const isAuto = entry.content.includes('The user has approved this document') ||
+                                           entry.content.includes('The user has provided feedback') ||
+                                           entry.content.includes('The user has rejected this document');
+                            if (!isAuto) break;
+                        }
+                        if (entry.source === 'MODEL' && entry.type === 'PLANNER_RESPONSE' && entry.content) {
+                            const cleaned = _cleanTranscriptModelText(entry.content, includeThoughts);
+                            if (cleaned) modelMsgs.unshift(cleaned);
+                        }
+                    } catch (_) {}
+                }
+
+                if (modelMsgs.length > 0) {
+                    const body = onlyFinalStep ? modelMsgs[modelMsgs.length - 1] : modelMsgs.join('\n\n');
+                    return { text: body + modalText, buttons: modalButtons };
+                }
+            } catch (_) {}
+
+            if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 600));
+            }
+        }
+    }
+
+    if (modalText) {
+        return { text: modalText.trim(), buttons: modalButtons };
+    }
+
+    // Fallback to DOM only if this conversation is currently open on screen
+    const activeUiId = await getActiveThreadId(port, targetIdToUse).catch(() => null);
+    if (!activeUiId || activeUiId === conversationId) {
+        return getFullLatestResponse(port, targetIdToUse, threadName, includeThoughts);
+    }
+
+    return { text: t('ask.working') || '⏳ Agent 正在处理此对话...', buttons: null };
 }

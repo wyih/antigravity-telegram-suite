@@ -135,10 +135,19 @@ const STANDALONE_LOCATORS_SCRIPT = `
         },
 
         isLoading: () => {
+            try {
+                const activeMatch = window.location.pathname.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                if (activeMatch) {
+                    const sidebarSpinner = document.querySelector('a[href*="' + activeMatch[1] + '"] [data-testid="status-loading-spinner"]');
+                    if (sidebarSpinner) return true;
+                }
+            } catch (e) {}
+
             const chatArea = document.querySelector('.relative.flex.flex-col.gap-y-3') || document.querySelector('.chat-messages') || document.querySelector('.theme-standalone main') || document;
             const selectors = [
                 '.loading', 
                 '.thinking-indicator',
+                '[data-testid="status-loading-spinner"]',
                 '[class*="animate-spin"]',
                 '[class*="spinner"]', 
                 '[class*="loader"]'

@@ -11,10 +11,11 @@ const { config, isIDERunning, killIDE, cleanLockFile, launchIDE, getLastWorkspac
 
 // Initialize sleep prevention on macOS if enabled in .env
 initCaffeinate();
-const { isAgentWorking, getFullLatestResponse, snapshotChatState, captureAgentScreenshot, captureFullIDEScreenshot, waitForAgentResponse, sendViaCDP, clickArtifactButton, triggerNewChat, triggerModelMenu, getAvailableModels, selectModel, getCurrentModel, getCurrentPermissionMode, selectPermissionMode, stopAgent, getQuota, listWindows, setPreferredWindow, getPreferredWindow, getPreferredTargetId, getCachedWindows, closeWindow, closeAllEditors, listAgentThreads, switchAgentThread, getActiveThreadId, getActiveThreadInfo, setActiveWorkspace, switchStandaloneWorkspace, listStandaloneWorkspaces, getLastResolvedThreadId, setLastResolvedThreadId, setOnThreadResolved } = require('./cdp_controller');
+const { isAgentWorking, getFullLatestResponse, snapshotChatState, captureAgentScreenshot, captureFullIDEScreenshot, waitForAgentResponse, sendViaCDP, clickArtifactButton, triggerNewChat, triggerModelMenu, getAvailableModels, selectModel, getCurrentModel, getCurrentPermissionMode, selectPermissionMode, stopAgent, getQuota, listWindows, setPreferredWindow, getPreferredWindow, getPreferredTargetId, getCachedWindows, closeWindow, closeAllEditors, listAgentThreads, switchAgentThread, getActiveThreadId, getActiveThreadInfo, setActiveWorkspace, switchStandaloneWorkspace, listStandaloneWorkspaces, getLastResolvedThreadId, setLastResolvedThreadId, setOnThreadResolved, getTranscriptSize, resolveActiveConversationAfterSend, waitForConversationResponse, getConversationLatestResponse } = require('./cdp_controller');
 const autoaccept = require('./autoaccept');
 const updater = require('./updater');
 const TaskWatcher = require('./task_watcher');
+const { TopicRouter } = require('./topic_router');
 const { extractLocalImageMarkdown } = require('./local_media');
 const { ensureCdpReady, isConnectionRefusedError } = require('./cdp_health');
 const accountManager = require('./account_manager');
@@ -131,6 +132,55 @@ if (ALLOWED_CHAT_IDS.length === 0) {
 }
 
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 900000 }); // 15 minutes timeout to allow long /ask requests
+const topicRouter = new TopicRouter();
+
+// Serialize CDP UI navigation + message submission across concurrent Telegram topics
+let _cdpUiQueue = Promise.resolve();
+function withCdpUiLock(fn) {
+    const run = _cdpUiQueue.then(fn, fn);
+    _cdpUiQueue = run.catch(() => {});
+    return run;
+}
+
+function hasBotTopicsEnabled(ctx = null) {
+    return Boolean(ctx?.botInfo?.has_topics_enabled || bot.botInfo?.has_topics_enabled);
+}
+
+async function createTelegramTopic(chatId, name) {
+    const safeName = String(name || '💬 新对话').slice(0, 120);
+    const res = await bot.telegram.callApi('createForumTopic', {
+        chat_id: chatId,
+        name: safeName
+    });
+    return res && typeof res.message_thread_id === 'number' ? res.message_thread_id : null;
+}
+
+async function renameTelegramTopic(chatId, messageThreadId, name) {
+    if (!chatId || !messageThreadId || !name) return false;
+    try {
+        await bot.telegram.callApi('editForumTopic', {
+            chat_id: chatId,
+            message_thread_id: Number(messageThreadId),
+            name: String(name).slice(0, 120)
+        });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function isDeletedTopicError(err) {
+    const m = (err?.message || '').toLowerCase();
+    return m.includes('message thread not found') || m.includes('topic_deleted') || m.includes('topic_id_invalid');
+}
+
+// Ensure Telegraf 4.16 routes ctx.reply / ctx.sendChatAction into private-chat topics whenever message_thread_id is present
+bot.use((ctx, next) => {
+    if (ctx.msg && typeof ctx.msg.message_thread_id === 'number' && !ctx.msg.is_topic_message) {
+        ctx.msg.is_topic_message = true;
+    }
+    return next();
+});
 
 const pendingLogins = new Map();
 const lastSentMessageIdMap = new Map(); // conversationId -> { messageId, chatId, baseKeyboard }
@@ -814,12 +864,14 @@ async function setReaction(ctx, emoji, messageId = null) {
     }
 }
 
-// Typing-aware progress callback factory
+// Typing-aware & intermediate progress callback factory
 function createProgressHandler(ctx) {
     return (msg) => {
         if (msg === 'typing') {
             ctx.sendChatAction('typing').catch(() => {});
-        } else {
+        } else if (msg && typeof msg === 'object' && msg.type === 'progress' && msg.text) {
+            sendBotMessage(ctx, msg.text, '⏳ 进度更新').catch(() => {});
+        } else if (typeof msg === 'string') {
             ctx.reply(msg).catch(() => {});
         }
     };
@@ -1061,21 +1113,30 @@ bot.command('status', handleStatus);
 /**
  * Appends thread info and agent status footer to response text.
  */
-async function getChatHeader(targetId = null, fallback = '') {
+function formatHeaderFromInfo(wsName, thName, includeSwipeHint = true) {
+    const cleanWs = wsName || 'Workspace';
+    let cleanTh = thName || 'Agent';
+    if (cleanTh.length > 42) {
+        cleanTh = cleanTh.substring(0, 40) + '…';
+    }
+    if (!includeSwipeHint) {
+        return `📁 ${cleanWs}\n🤖 ${cleanTh}`;
+    }
+    return `📁 ${cleanWs}\n🤖 ${cleanTh}\n${t('agent.swipe_to_reply')}`;
+}
+
+async function getChatHeader(targetId = null, fallback = '', explicitMeta = null, inTopic = false) {
+    if (explicitMeta && (explicitMeta.title || explicitMeta.workspace)) {
+        return formatHeaderFromInfo(
+            explicitMeta.workspace || 'Workspace',
+            explicitMeta.title || 'Agent',
+            !inTopic
+        );
+    }
     try {
         const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId);
         if (activeInfo) {
-            const wsName = activeInfo.workspace || 'Workspace';
-            let thName = activeInfo.name || 'Agent';
-            if (thName.length > 35) {
-                const words = thName.split(' ');
-                if (words.length > 5) {
-                    thName = words.slice(0, 5).join(' ') + '...';
-                } else {
-                    thName = thName.substring(0, 35) + '...';
-                }
-            }
-            return `📁 ${wsName}\n🤖 ${thName}\n${t('agent.swipe_to_reply')}`;
+            return formatHeaderFromInfo(activeInfo.workspace, activeInfo.name, !inTopic);
         }
     } catch (_) {}
     return fallback;
@@ -1174,6 +1235,7 @@ async function sendMainMenu(ctx, text = '🕹️ Kontrol Paneli:', overrideThrea
 
 async function pushMainMenuToUser(text, silent = false) {
     if (ALLOWED_CHAT_IDS.length === 0 || process.env.SETUP_MODE === 'true') return;
+    if (silent && hasBotTopicsEnabled()) return;
     const kb = await buildMainMenu();
     return Promise.all(ALLOWED_CHAT_IDS.map(id => bot.telegram.sendMessage(id, text, { ...kb, disable_notification: silent }).catch(() => {})));
 }
@@ -1182,17 +1244,35 @@ bot.command('start', async (ctx) => {
     await sendMainMenu(ctx, t('menu.welcome'));
 });
 
+function registerWatchedConversation(conversationId) {
+    if (!conversationId) return;
+    if (global.__taskWatcher) {
+        global.__taskWatcher.watchConversation(conversationId);
+    }
+    watchArtifacts(conversationId);
+}
+
 const handleLatest = async (ctx) => {
     try {
-        await ensureAppCdpReady();
-        // Use the preferred target (set by workspace switch or /window command)
-        // instead of blindly picking candidates[0] which may be the wrong window
+        const msgThreadId = topicRouter.getCtxThreadId(ctx);
+        const binding = msgThreadId ? topicRouter.getBinding(ctx.chat.id, msgThreadId) : null;
         const targetId = getPreferredTargetId() || null;
+
+        if (binding?.conversationId) {
+            const _latestRes = await getConversationLatestResponse(CDP_PORT, binding.conversationId, targetId, binding.title, true, false);
+            const text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+            const buttons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+            const header = await getChatHeader(targetId, t('latest.title'), binding, true);
+            await sendBotMessage(ctx, text, header, buttons);
+            return;
+        }
+
+        await ensureAppCdpReady();
         let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, null, true);
         let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
         let buttons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
         
-        const header = await getChatHeader(targetId, t('latest.title'));
+        const header = await getChatHeader(targetId, t('latest.title'), null, Boolean(msgThreadId));
         await sendBotMessage(ctx, text, header, buttons);
     } catch (err) {
         ctx.reply(t('latest.error', { error: err.message }));
@@ -1205,8 +1285,18 @@ bot.hears(/^💬/i, handleLatest);
 const handleScreenshot = async (ctx) => {
     try {
         setReaction(ctx, REACTION.THINKING);
-        await ensureAppCdpReady();
-        const buffer = await captureFullIDEScreenshot(CDP_PORT);
+        const msgThreadId = topicRouter.getCtxThreadId(ctx);
+        const binding = msgThreadId ? topicRouter.getBinding(ctx.chat.id, msgThreadId) : null;
+        const buffer = await withCdpUiLock(async () => {
+            await ensureAppCdpReady();
+            if (binding?.conversationId) {
+                const active = await getActiveThreadInfo(CDP_PORT).catch(() => null);
+                if (!active || active.id !== binding.conversationId) {
+                    await switchAgentThread(CDP_PORT, binding.title || '', binding.workspace || null, binding.conversationId).catch(() => {});
+                }
+            }
+            return captureFullIDEScreenshot(CDP_PORT);
+        });
         await ctx.replyWithPhoto({ source: buffer });
         setReaction(ctx, null);
     } catch (err) {
@@ -1238,46 +1328,10 @@ bot.command('ask', (ctx) => {
     const query = parts.join(' ').trim();
     
     if (!query) return ctx.reply(t('ask.empty'));
-    
-    (async () => {
-        try {
-            const targetId = await sendViaCDP(query, CDP_PORT);
-            setReaction(ctx, REACTION.THINKING);
-
-            // Wait briefly for message to render in DOM before anchoring state
-            await new Promise(r => setTimeout(r, 500));
-            await snapshotChatState(CDP_PORT, targetId).catch(() => {});
-            
-            if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
-            isAgentBusy = true;
-            try {
-                const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx));
-                if (isDone) {
-                    await new Promise(r => setTimeout(r, 500));
-                    let _latestRes = await getFullLatestResponse(CDP_PORT);
-                    let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
-                    let buttons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
-                    
-                    text = stripQueryFromResponse(text, query);
-                    if (!text) text = t('ask.done_empty');
-                    setReaction(ctx, null);
-                    const header = await getChatHeader(null, t('ask.done'));
-                    await sendBotMessage(ctx, text, header, buttons);
-                } else {
-                    await ctx.reply(t('ask.timeout'));
-                }
-            } finally {
-                isAgentBusy = false;
-                if (global.__taskWatcher) {
-                    global.__taskWatcher.setBusy(false);
-                    global.__taskWatcher.syncBaseline();
-                }
-            }
-        } catch (err) {
-            setReaction(ctx, null);
-            ctx.reply(t('ask.send_error', { error: err.message })).catch(() => {});
-        }
-    })();
+    executeTopicAwarePrompt(ctx, query, { replyToMsgId: ctx.message.message_id }).catch((err) => {
+        setReaction(ctx, null);
+        ctx.reply(t('ask.send_error', { error: err.message })).catch(() => {});
+    });
 });
 
 
@@ -1304,7 +1358,18 @@ bot.command('cmd', async (ctx) => {
 bot.command('stop', async (ctx) => {
     try {
         setReaction(ctx, REACTION.THINKING);
-        const stopped = await stopAgent(CDP_PORT);
+        const msgThreadId = topicRouter.getCtxThreadId(ctx);
+        const binding = msgThreadId ? topicRouter.getBinding(ctx.chat.id, msgThreadId) : null;
+        const stopped = await withCdpUiLock(async () => {
+            await ensureAppCdpReady();
+            if (binding?.conversationId) {
+                const active = await getActiveThreadInfo(CDP_PORT).catch(() => null);
+                if (!active || active.id !== binding.conversationId) {
+                    await switchAgentThread(CDP_PORT, binding.title || '', binding.workspace || null, binding.conversationId).catch(() => {});
+                }
+            }
+            return stopAgent(CDP_PORT);
+        });
         if (stopped) {
             ctx.reply(t('stop.stopped'));
         } else {
@@ -1570,20 +1635,45 @@ bot.action(/^sch_del_(.+)$/, async (ctx) => {
 
 bot.command('new', async (ctx) => {
     console.log('[/new] Command triggered');
+    const customName = (ctx.message?.text || '').replace(/^\/new(@\w+)?\s*/i, '').trim();
     try {
-        await ensureAppCdpReady();
-        const success = await triggerNewChat(CDP_PORT);
+        const success = await withCdpUiLock(async () => {
+            await ensureAppCdpReady();
+            return triggerNewChat(CDP_PORT);
+        });
         console.log('[/new] triggerNewChat result:', success);
-        if (success) {
-            ctx.reply(t('new_chat.opened'));
-            if (process.env.DEFAULT_MODEL) {
-                setTimeout(() => {
-                    selectModel(CDP_PORT, process.env.DEFAULT_MODEL).catch(()=>{});
-                }, 1500);
-            }
-        } else {
-            ctx.reply(t('new_chat.not_found'));
+        if (!success) {
+            return ctx.reply(t('new_chat.not_found'));
         }
+        if (process.env.DEFAULT_MODEL) {
+            setTimeout(() => {
+                selectModel(CDP_PORT, process.env.DEFAULT_MODEL).catch(() => {});
+            }, 1500);
+        }
+
+        if (hasBotTopicsEnabled(ctx)) {
+            const chatId = ctx.chat.id;
+            const currentThreadId = topicRouter.getCtxThreadId(ctx);
+            const currentBinding = currentThreadId ? topicRouter.getBinding(chatId, currentThreadId) : null;
+
+            if (!currentThreadId || currentBinding) {
+                const topicLabel = customName ? `💬 ${customName.slice(0, 110)}` : '💬 新对话';
+                const newThreadId = await createTelegramTopic(chatId, topicLabel).catch(() => null);
+                if (newThreadId) {
+                    const kb = await buildMainMenu('新对话', null, null);
+                    await bot.telegram.sendMessage(
+                        chatId,
+                        '✨ <b>新对话标签页已就绪</b>\n直接在这个标签页发第一条消息，就会自动创建并绑定对应的 Antigravity 新对话。',
+                        { message_thread_id: newThreadId, parse_mode: 'HTML', ...kb }
+                    ).catch(() => {});
+                    return ctx.reply(`✅ 已创建新标签页「<b>${escapeHtml(topicLabel)}</b>」，点击顶部新标签页即可直接开始聊。`, { parse_mode: 'HTML' });
+                }
+            } else {
+                return ctx.reply('✨ 当前标签页已准备就绪，直接发第一条消息就会自动创建并绑定新的 Antigravity 对话。');
+            }
+        }
+
+        ctx.reply(t('new_chat.opened'));
     } catch(e) {
         console.log('[/new] Error:', e.message);
         ctx.reply(t('new_chat.error', { error: e.message }));
@@ -1600,26 +1690,36 @@ function escapeHtml(str) {
         .replace(/'/g, '&#39;');
 }
 
-async function renderAgentsKeyboard(workspaces, activeInfo) {
+async function renderAgentsKeyboard(workspaces, activeInfo, ctx = null) {
     const inline_keyboard = [];
+    const chatId = ctx?.chat?.id;
+    const msgThreadId = topicRouter.getCtxThreadId(ctx);
+    const currentBinding = (chatId && msgThreadId) ? topicRouter.getBinding(chatId, msgThreadId) : null;
     
-    // 1. Quick Recent Chats (top 4 threads across all projects)
+    // 1. Quick Recent Chats (top 6 threads across all projects)
     const allRecent = [];
     for (const ws of workspaces) {
         for (const th of ws.threads) {
             if (th.name && !/^(Ran|Worked for|Explored)\b/i.test(th.name) && !/^show\s+\d+\s+more/i.test(th.name)) {
-                allRecent.push({ ...th, workspace: ws.workspace });
+                let threadId = th.threadId || null;
+                if (!threadId && th.href) {
+                    const m = th.href.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                    if (m) threadId = m[1];
+                }
+                allRecent.push({ ...th, workspace: ws.workspace, threadId });
             }
         }
     }
 
-    const topRecent = allRecent.slice(0, 4);
+    const topRecent = allRecent.slice(0, 6);
     for (const th of topRecent) {
         const thIdx = cachedAgentThreads.findIndex(t => t.name === th.name && t.workspace === th.workspace);
         const idx = thIdx >= 0 ? thIdx + 1 : 1;
         let displayName = th.name.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
         if (displayName.length > 28) displayName = displayName.substring(0, 26) + '…';
-        inline_keyboard.push([{ text: `💬 ${displayName}`, callback_data: `ag_th:${idx}` }]);
+        const hasTopic = chatId && th.threadId ? Boolean(topicRouter.getTopicForConversation(chatId, th.threadId)) : false;
+        const icon = hasTopic ? '📌' : '💬';
+        inline_keyboard.push([{ text: `${icon} ${displayName}`, callback_data: `ag_th:${idx}` }]);
     }
 
     // 2. Project Filter Buttons (if multiple projects exist)
@@ -1647,25 +1747,33 @@ async function renderAgentsKeyboard(workspaces, activeInfo) {
 
     const activeChat = activeInfo?.name || '—';
     const activeProject = activeInfo?.workspace || 'Default';
-    const text = t('agents.menu_title', {
+    let text = t('agents.menu_title', {
         activeChat: escapeHtml(activeChat),
         activeProject: escapeHtml(activeProject)
     });
+    if (currentBinding) {
+        text = `📌 <b>当前标签页对话：</b>${escapeHtml(currentBinding.title || currentBinding.conversationId.substring(0, 8))}\n\n` + text;
+    } else if (hasBotTopicsEnabled(ctx)) {
+        text += `\n\n💡 <i>点选下方任意对话，会自动打开/创建它专属的顶部标签页（📌 表示已有标签页）。</i>`;
+    }
 
     return { text, reply_markup: { inline_keyboard } };
 }
 
-function renderProjectThreadsKeyboard(ws, wsIdx) {
+function renderProjectThreadsKeyboard(ws, wsIdx, chatId = null) {
     const inline_keyboard = [];
     const validThreads = ws.threads.filter(th => th.name && !/^(Ran|Worked for|Explored)\b/i.test(th.name));
     
     for (const th of validThreads) {
         const thIdx = cachedAgentThreads.findIndex(t => t.name === th.name && t.workspace === ws.workspace);
         const idx = thIdx >= 0 ? thIdx + 1 : 1;
+        const cachedItem = thIdx >= 0 ? cachedAgentThreads[thIdx] : th;
         let displayName = th.name.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
         if (displayName.length > 32) displayName = displayName.substring(0, 30) + '…';
         const timeStr = th.time ? ` (${th.time})` : '';
-        inline_keyboard.push([{ text: `💬 ${displayName}${timeStr}`, callback_data: `ag_th:${idx}` }]);
+        const hasTopic = chatId && cachedItem?.threadId ? Boolean(topicRouter.getTopicForConversation(chatId, cachedItem.threadId)) : false;
+        const icon = hasTopic ? '📌' : '💬';
+        inline_keyboard.push([{ text: `${icon} ${displayName}${timeStr}`, callback_data: `ag_th:${idx}` }]);
     }
 
     inline_keyboard.push([
@@ -1681,10 +1789,44 @@ function renderProjectThreadsKeyboard(ws, wsIdx) {
     return { text, reply_markup: { inline_keyboard } };
 }
 
-async function executeAgentThreadSwitch(ctx, thread, isCallback = false) {
-    await ensureAppCdpReady();
-    const targetId = await switchAgentThread(CDP_PORT, thread.name, thread.workspace, thread.threadId);
-    if (!targetId) {
+async function sendTopicConversationIntro(chatId, messageThreadId, convId, convTitle, convWs, targetId = null) {
+    const kb = await buildMainMenu(convTitle, convWs, targetId);
+    let previewBlock = '';
+    try {
+        const latest = await getConversationLatestResponse(CDP_PORT, convId, targetId, convTitle, false, true);
+        const latestText = typeof latest === 'string' ? latest : latest?.text;
+        if (latestText && latestText !== t('latest.not_found_active')) {
+            const trimmed = latestText.length > 900 ? latestText.slice(0, 900) + '…' : latestText;
+            previewBlock = `\n\n<b>最近一条回复：</b>\n${markdownToTelegramHtml(trimmed)}`;
+        }
+    } catch (_) {}
+
+    const introHtml =
+        `📌 <b>已绑定对话：</b>${escapeHtml(convTitle)}\n` +
+        `📁 <b>项目：</b>${escapeHtml(convWs || 'Outside of Project')}\n` +
+        `<i>直接在这个标签页发消息，就会自动路由到该对话并实时推送工作进度。</i>` +
+        previewBlock;
+
+    return bot.telegram.sendMessage(chatId, introHtml, {
+        message_thread_id: messageThreadId,
+        parse_mode: 'HTML',
+        ...kb
+    });
+}
+
+async function executeAgentThreadSwitch(ctx, thread, isCallback = false, forceBindCurrent = false) {
+    const switchResult = await withCdpUiLock(async () => {
+        await ensureAppCdpReady();
+        const targetId = await switchAgentThread(CDP_PORT, thread.name, thread.workspace, thread.threadId);
+        if (!targetId) return null;
+        setPreferredWindow(null);
+        if (thread.workspace) setActiveWorkspace(thread.workspace);
+        await snapshotChatState(CDP_PORT, targetId, thread.name).catch(() => {});
+        const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
+        return { targetId, activeInfo };
+    });
+
+    if (!switchResult || !switchResult.targetId) {
         const errMsg = t('agents.not_found') || '❌ Thread could not be selected.';
         if (isCallback) {
             try { await ctx.answerCbQuery(errMsg, { show_alert: true }); } catch(_) {}
@@ -1694,19 +1836,99 @@ async function executeAgentThreadSwitch(ctx, thread, isCallback = false) {
         return false;
     }
 
-    setPreferredWindow(null);
-    if (thread.workspace) setActiveWorkspace(thread.workspace);
-    await snapshotChatState(CDP_PORT, targetId, thread.name).catch(() => {});
+    const { targetId, activeInfo } = switchResult;
+    const convId = thread.threadId || activeInfo?.id || getLastResolvedThreadId();
+    const convTitle = thread.name || activeInfo?.name || 'Conversation';
+    const convWs = thread.workspace || activeInfo?.workspace || '';
 
-    const successMsg = t('agents.switched', { name: escapeHtml(thread.name) });
+    if (convId) {
+        registerWatchedConversation(convId);
+    }
+
+    if (convId && hasBotTopicsEnabled(ctx) && ctx.chat?.id) {
+        const chatId = ctx.chat.id;
+        const currentThreadId = topicRouter.getCtxThreadId(ctx);
+        const topicTitle = topicRouter.formatTopicTitle(convTitle, convWs);
+
+        if (isCallback) {
+            try { await ctx.answerCbQuery(t('agents.switched_plain', { name: convTitle })); } catch (_) {}
+        }
+
+        // 1. Explicit bind to current topic tab
+        if (forceBindCurrent && currentThreadId) {
+            topicRouter.bindTopic(chatId, currentThreadId, { conversationId: convId, title: convTitle, workspace: convWs });
+            await renameTelegramTopic(chatId, currentThreadId, topicTitle);
+            if (isCallback) {
+                try { await ctx.deleteMessage(); } catch (_) {}
+            }
+            await sendTopicConversationIntro(chatId, currentThreadId, convId, convTitle, convWs, targetId).catch(() => {
+                return sendMainMenu(ctx, t('agents.switched', { name: escapeHtml(convTitle) }), convTitle, convWs);
+            });
+            return true;
+        }
+
+        // 2. Existing topic tab already bound to this conversation
+        let existingTopic = topicRouter.getTopicForConversation(chatId, convId);
+        if (existingTopic) {
+            if (existingTopic.messageThreadId === currentThreadId) {
+                topicRouter.bindTopic(chatId, currentThreadId, { conversationId: convId, title: convTitle, workspace: convWs });
+                if (isCallback) {
+                    try { await ctx.deleteMessage(); } catch (_) {}
+                }
+                await sendTopicConversationIntro(chatId, currentThreadId, convId, convTitle, convWs, targetId).catch(() => {});
+                return true;
+            }
+
+            try {
+                await sendTopicConversationIntro(chatId, existingTopic.messageThreadId, convId, convTitle, convWs, targetId);
+                const thIdx = cachedAgentThreads.findIndex(t => t.threadId === convId || (t.name === thread.name && t.workspace === thread.workspace));
+                const extraKb = (currentThreadId && thIdx >= 0)
+                    ? { inline_keyboard: [[{ text: '📌 改绑到当前标签页', callback_data: `ag_bind_here:${thIdx + 1}` }]] }
+                    : undefined;
+                const notice = `✅ 已唤醒专属标签页「<b>${escapeHtml(topicTitle)}</b>」，点击顶部该标签页即可直接聊。`;
+                if (isCallback && ctx.callbackQuery?.message) {
+                    await ctx.editMessageText(notice, { parse_mode: 'HTML', reply_markup: extraKb }).catch(() => ctx.reply(notice, { parse_mode: 'HTML', reply_markup: extraKb }));
+                } else {
+                    await ctx.reply(notice, { parse_mode: 'HTML', reply_markup: extraKb });
+                }
+                return true;
+            } catch (err) {
+                if (isDeletedTopicError(err)) {
+                    topicRouter.unbindTopic(chatId, existingTopic.messageThreadId);
+                    existingTopic = null;
+                }
+            }
+        }
+
+        // 3. Create a brand-new dedicated Telegram Topic Tab for this conversation
+        const createdThreadId = await createTelegramTopic(chatId, topicTitle).catch(() => null);
+        if (createdThreadId) {
+            topicRouter.bindTopic(chatId, createdThreadId, { conversationId: convId, title: convTitle, workspace: convWs });
+            await sendTopicConversationIntro(chatId, createdThreadId, convId, convTitle, convWs, targetId).catch(() => {});
+            const createdNotice = `✅ 已为「<b>${escapeHtml(convTitle)}</b>」创建专属标签页「<b>${escapeHtml(topicTitle)}</b>」，点顶部该标签页就能直接聊！`;
+            if (isCallback && ctx.callbackQuery?.message) {
+                await ctx.editMessageText(createdNotice, { parse_mode: 'HTML' }).catch(() => ctx.reply(createdNotice, { parse_mode: 'HTML' }));
+            } else {
+                await ctx.reply(createdNotice, { parse_mode: 'HTML' });
+            }
+            return true;
+        }
+
+        // Fallback: bind current topic if createForumTopic wasn't available
+        if (currentThreadId) {
+            topicRouter.bindTopic(chatId, currentThreadId, { conversationId: convId, title: convTitle, workspace: convWs });
+        }
+    }
+
+    const successMsg = t('agents.switched', { name: escapeHtml(convTitle) });
     if (isCallback) {
-        try { await ctx.answerCbQuery(t('agents.switched_plain', { name: thread.name })); } catch(_) {}
+        try { await ctx.answerCbQuery(t('agents.switched_plain', { name: convTitle })); } catch(_) {}
         try { await ctx.deleteMessage(); } catch (_) {
             try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (__) {}
         }
     }
 
-    await sendMainMenu(ctx, successMsg, thread.name, thread.workspace);
+    await sendMainMenu(ctx, successMsg, convTitle, convWs);
     return true;
 }
 
@@ -1744,7 +1966,7 @@ async function renderAndSendAgentThreads(ctx, port, editMessageId = null) {
     }
 
     const activeInfo = await getActiveThreadInfo(port).catch(() => null);
-    const view = await renderAgentsKeyboard(workspaces, activeInfo);
+    const view = await renderAgentsKeyboard(workspaces, activeInfo, ctx);
 
     if (editMessageId) {
         try {
@@ -1757,6 +1979,29 @@ async function renderAndSendAgentThreads(ctx, port, editMessageId = null) {
 
     await ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
 }
+
+bot.command('bind', async (ctx) => {
+    const currentThreadId = topicRouter.getCtxThreadId(ctx);
+    if (!currentThreadId) {
+        return ctx.reply('⚠️ 请先在某个 Topic 标签页内发送 /bind，将当前标签页绑定到当前打开的 Antigravity 对话。');
+    }
+    try {
+        await ensureAppCdpReady();
+        const activeInfo = await getActiveThreadInfo(CDP_PORT).catch(() => null);
+        const convId = activeInfo?.id || getLastResolvedThreadId();
+        if (!convId) {
+            return ctx.reply('⚠️ 当前未检测到打开的 Antigravity 对话，请先通过 /agents 选择一个对话。');
+        }
+        const title = activeInfo?.name || 'Conversation';
+        const workspace = activeInfo?.workspace || '';
+        topicRouter.bindTopic(ctx.chat.id, currentThreadId, { conversationId: convId, title, workspace });
+        registerWatchedConversation(convId);
+        await renameTelegramTopic(ctx.chat.id, currentThreadId, topicRouter.formatTopicTitle(title, workspace));
+        await sendTopicConversationIntro(ctx.chat.id, currentThreadId, convId, title, workspace, null);
+    } catch (e) {
+        ctx.reply(`❌ 绑定失败：${e.message}`);
+    }
+});
 
 bot.command('agents', async (ctx) => {
     const rawText = ctx.message.text.trim();
@@ -1834,7 +2079,17 @@ bot.action(/^ag_th:(\d+)$/, async (ctx) => {
     const num = parseInt(ctx.match[1], 10);
     if (num > 0 && num <= cachedAgentThreads.length) {
         const thread = cachedAgentThreads[num - 1];
-        await executeAgentThreadSwitch(ctx, thread, true);
+        await executeAgentThreadSwitch(ctx, thread, true, false);
+    } else {
+        try { await ctx.answerCbQuery(t('agents.invalid_number') || '❌ Invalid thread number.', { show_alert: true }); } catch(_) {}
+    }
+});
+
+bot.action(/^ag_bind_here:(\d+)$/, async (ctx) => {
+    const num = parseInt(ctx.match[1], 10);
+    if (num > 0 && num <= cachedAgentThreads.length) {
+        const thread = cachedAgentThreads[num - 1];
+        await executeAgentThreadSwitch(ctx, thread, true, true);
     } else {
         try { await ctx.answerCbQuery(t('agents.invalid_number') || '❌ Invalid thread number.', { show_alert: true }); } catch(_) {}
     }
@@ -1844,7 +2099,7 @@ bot.action(/^ag_ws:(\d+)$/, async (ctx) => {
     const wsIdx = parseInt(ctx.match[1], 10);
     if (wsIdx >= 0 && wsIdx < cachedWorkspacesList.length) {
         const ws = cachedWorkspacesList[wsIdx];
-        const view = renderProjectThreadsKeyboard(ws, wsIdx);
+        const view = renderProjectThreadsKeyboard(ws, wsIdx, ctx.chat?.id);
         try {
             await ctx.answerCbQuery();
             await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
@@ -1860,7 +2115,7 @@ bot.action('ag_back', async (ctx) => {
     try {
         await ctx.answerCbQuery();
         const activeInfo = await getActiveThreadInfo(CDP_PORT).catch(() => null);
-        const view = await renderAgentsKeyboard(cachedWorkspacesList, activeInfo);
+        const view = await renderAgentsKeyboard(cachedWorkspacesList, activeInfo, ctx);
         await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
     } catch (e) {
         console.debug('[ag_back] edit failed:', e.message);
@@ -2006,15 +2261,17 @@ function formatMarkdownForTelegram(markdownText) {
     return text.trim();
 }
 
-async function sendFormattedTelegramMessage(botInstance, chatId, title, rawContent, inlineKeyboard = []) {
+async function sendFormattedTelegramMessage(botInstance, chatId, title, rawContent, inlineKeyboard = [], messageThreadId = null) {
     const formattedBody = formatMarkdownForTelegram(rawContent);
     const header = `📝 <b>${escHtml(title)}</b>\n\n`;
     const fullText = header + formattedBody;
+    const threadExtra = messageThreadId ? { message_thread_id: messageThreadId } : {};
 
     const MAX_LEN = 3800;
     if (fullText.length <= MAX_LEN) {
         return await botInstance.telegram.sendMessage(chatId, fullText, {
             parse_mode: 'HTML',
+            ...threadExtra,
             reply_markup: inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined
         });
     }
@@ -2052,6 +2309,7 @@ async function sendFormattedTelegramMessage(botInstance, chatId, title, rawConte
         const keyboard = isLast && inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
         lastSent = await botInstance.telegram.sendMessage(chatId, chunks[i], {
             parse_mode: 'HTML',
+            ...threadExtra,
             reply_markup: keyboard
         });
     }
@@ -2150,7 +2408,8 @@ function watchArtifacts(conversationId, retry = 0) {
                             const inlineKeyboard = [[{ text: '📄 Download File', callback_data: `ff_${pathId}` }]];
 
                             for (const chatId of ALLOWED_CHAT_IDS) {
-                                await sendFormattedTelegramMessage(bot, chatId, title, rawContent, inlineKeyboard).catch(err => {
+                                const topic = topicRouter.getTopicForConversation(chatId, conversationId);
+                                await sendFormattedTelegramMessage(bot, chatId, title, rawContent, inlineKeyboard, topic?.messageThreadId || null).catch(err => {
                                     console.error(`[Artifact Watcher] Failed to send artifact to ${chatId}:`, err.message);
                                 });
                             }
@@ -2439,16 +2698,18 @@ const handleArtifacts = async (ctx) => {
             try { return fs.statSync(filePath).mtimeMs; } catch (_) { return 0; }
         };
 
-        // Try to get the active thread info for workspace filtering
+        // Try to get the bound topic conversation first, then active thread info
+        const msgThreadId = topicRouter.getCtxThreadId(ctx);
+        const topicBinding = msgThreadId ? topicRouter.getBinding(ctx.chat.id, msgThreadId) : null;
         let threadInfo = null;
         try {
             await ensureAppCdpReady();
             threadInfo = await getActiveThreadInfo(CDP_PORT, getPreferredTargetId());
         } catch (_) {}
-        const workspaceName = threadInfo?.workspace?.split(' - ')?.[0]?.trim()?.toLowerCase() || null;
+        const workspaceName = (topicBinding?.workspace || threadInfo?.workspace)?.split(' - ')?.[0]?.trim()?.toLowerCase() || null;
         
-        // Strategy: Try known thread ID first, then active thread from DOM, then scan all conversations
-        let conversationId = getLastResolvedThreadId();
+        // Strategy: Bound topic conversation first, then known thread ID, then active thread from DOM, then scan all conversations
+        let conversationId = topicBinding?.conversationId || getLastResolvedThreadId();
         
         if (!conversationId) {
             // Force resolution of the active thread if not already set (e.g. immediately after a restart)
@@ -4700,7 +4961,7 @@ function extractQuotedContext(ctx) {
 bot.action(/^ans_(.+)$/, async (ctx) => {
     const answer = ctx.match[1];
     await ctx.answerCbQuery(t('interactive_modal.answer_sent', { answer }));
-    
+
     let targetId = getPreferredTargetId();
     let explicitThreadName = null;
     if (ctx.callbackQuery.message) {
@@ -4708,62 +4969,22 @@ bot.action(/^ans_(.+)$/, async (ctx) => {
         if (typeof val === 'string') targetId = val;
         else if (val) { targetId = val.targetId; explicitThreadName = val.threadName; }
     }
-    
+
     // Fire-and-forget: don't block Telegraf's update loop
     (async () => {
-        isAgentBusy = true;
-        if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
         try {
             if (ctx.callbackQuery?.message) {
                 await ctx.editMessageReplyMarkup({
                     inline_keyboard: [[{ text: `✅ ${answer}`, callback_data: 'noop' }]]
                 }).catch(() => {});
             }
-
-            if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
-            setReaction(ctx, REACTION.THINKING, ctx.callbackQuery.message?.message_id).catch(() => {});
-            const res = await sendViaCDP(answer, CDP_PORT, targetId);
-            if (typeof res === 'string' && res !== "INVALID_MODAL_OPTION") targetId = res;
-            
-            if (res === "INVALID_MODAL_OPTION") {
-                return await ctx.reply(t('error.modal_active') || 'A modal is currently active in the IDE. Please select a valid option or dismiss it before sending a message.');
-            }
-
-            await new Promise(r => setTimeout(r, 500));
-            await snapshotChatState(CDP_PORT, targetId).catch(() => {});
-
-            const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
-            let text = "";
-            let interactiveButtons = null;
-            if (isDone) {
-                await new Promise(r => setTimeout(r, 500));
-                let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, explicitThreadName);
-                text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
-                interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
-                text = stripQueryFromResponse(text, answer);
-            } else {
-                return await ctx.reply(t('ask.timeout'));
-            }
-            
-            if (!text) text = t('ask.done_empty');
-            const header = await getChatHeader(targetId, t('ask.done'));
-            const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
-
-            const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.callbackQuery.message.message_id);
-            if (sentIds && sentIds.length > 0 && targetId) {
-                const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
-                const currentThreadName = activeInfo ? activeInfo.name : null;
-                sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
-                saveMessageTargetMap(messageTargetMap);
-            }
+            await executeTopicAwarePrompt(ctx, answer, {
+                explicitTargetId: targetId,
+                explicitThreadName,
+                replyToMsgId: ctx.callbackQuery?.message?.message_id || null
+            });
         } catch (e) {
-            ctx.reply(t('error.general_error', { error: e.message })).catch(()=>{});
-        } finally {
-            isAgentBusy = false;
-            if (global.__taskWatcher) {
-                global.__taskWatcher.setBusy(false);
-                global.__taskWatcher.syncBaseline();
-            }
+            ctx.reply(t('error.general_error', { error: e.message })).catch(() => {});
         }
     })();
 });
@@ -4775,7 +4996,14 @@ let isAgentBusy = false;
         const convId = ctx.match[1];
         try {
             await ctx.answerCbQuery(t('artifact_feedback.processing') || 'Processing...');
-            await clickArtifactButton('Proceed', CDP_PORT, null);
+            await withCdpUiLock(async () => {
+                await ensureAppCdpReady();
+                const active = await getActiveThreadInfo(CDP_PORT).catch(() => null);
+                if (convId && (!active || active.id !== convId)) {
+                    await switchAgentThread(CDP_PORT, '', null, convId).catch(() => {});
+                }
+                await clickArtifactButton('Proceed', CDP_PORT, null);
+            });
             await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: t('artifact_feedback.proceeded') || '✅ Proceeded', callback_data: 'noop' }]] });
         } catch (e) {
             console.error(e);
@@ -4788,7 +5016,14 @@ let isAgentBusy = false;
         const convId = ctx.match[1];
         try {
             await ctx.answerCbQuery(t('artifact_feedback.processing') || 'Processing...');
-            await clickArtifactButton('Cancel', CDP_PORT, null);
+            await withCdpUiLock(async () => {
+                await ensureAppCdpReady();
+                const active = await getActiveThreadInfo(CDP_PORT).catch(() => null);
+                if (convId && (!active || active.id !== convId)) {
+                    await switchAgentThread(CDP_PORT, '', null, convId).catch(() => {});
+                }
+                await clickArtifactButton('Cancel', CDP_PORT, null);
+            });
             await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: t('artifact_feedback.canceled') || '❌ Canceled', callback_data: 'noop' }]] });
         } catch (e) {
             console.error(e);
@@ -4809,169 +5044,249 @@ let isAgentBusy = false;
         'force_update', 'forceupdate',
         'version', 'menu', 'app', 'fix_shortcuts', 'restart', 'goal', 'plan', 'schedule_task', 'schedule_setup',
         'schedule_list', 'schedule_add', 'schedule_del', 'schedule_status', 'login', 'logincode', 'accounts',
-        'switchacc', 'getinfo', 'delacc', 'gettask', 'getplan', 'getwalk', 'watcher', 'turbo', 'mode', 'permissions', 'panel', 'ask'
+        'switchacc', 'getinfo', 'delacc', 'gettask', 'getplan', 'getwalk', 'watcher', 'turbo', 'mode', 'permissions', 'panel', 'ask', 'bind'
     ]);
 
-    bot.on('text', async (ctx, next) => {
-        const firstWord = ctx.message.text.split(/[\s@]+/)[0].replace(/^\//, '').toLowerCase();
-        if (ctx.message.text.startsWith('/') && KNOWN_BOT_COMMANDS.has(firstWord)) {
-            return next();
+    async function executeTopicAwarePrompt(ctx, query, options = {}) {
+        const {
+            explicitTargetId = null,
+            explicitThreadName = null,
+            originalCaption = null,
+            replyToMsgId = ctx.message?.message_id || null
+        } = options;
+
+        const chatId = ctx.chat?.id;
+        const msgThreadId = topicRouter.getCtxThreadId(ctx);
+        let binding = (chatId && msgThreadId) ? topicRouter.getBinding(chatId, msgThreadId) : null;
+
+        setReaction(ctx, REACTION.THINKING).catch(() => {});
+
+        // If THIS bound conversation is already in an active Telegram wait loop, inject follow-up without starting a duplicate wait loop
+        if (binding?.conversationId && global.__taskWatcher?.isConversationBusy(binding.conversationId)) {
+            await withCdpUiLock(async () => {
+                await ensureAppCdpReady();
+                const active = await getActiveThreadInfo(CDP_PORT, explicitTargetId).catch(() => null);
+                if (!active || active.id !== binding.conversationId) {
+                    await switchAgentThread(CDP_PORT, binding.title || '', binding.workspace || null, binding.conversationId).catch(() => {});
+                }
+                await sendViaCDPWithRecovery(query, explicitTargetId);
+            });
+            return;
         }
-    let query = ctx.message.text;
-    
-    let explicitTargetId = null;
-    let explicitThreadName = null;
-    if (ctx.message.reply_to_message) {
-        const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
-        if (typeof val === 'string') explicitTargetId = val;
-        else if (val) { explicitTargetId = val.targetId; explicitThreadName = val.threadName; }
-        
-        query = extractQuotedContext(ctx) + query;
-    }
-    if (!explicitTargetId && ctx.message.reply_to_message?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('focus_')) {
-        explicitTargetId = ctx.message.reply_to_message.reply_markup.inline_keyboard[0][0].callback_data.replace('focus_', '');
-    }
 
-    // If agent is already processing, just send the follow-up message without starting a new wait loop
-    if (isAgentBusy) {
-        try {
-            if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
-            await sendViaCDPWithRecovery(query, explicitTargetId);
-            setReaction(ctx, REACTION.THINKING).catch(() => {});
-        } catch (err) {
-            ctx.reply(t('ask.headless_error', { error: err.message })).catch(() => {});
+        // Phase 1: Under UI lock, switch/create the right Antigravity conversation and submit the prompt
+        const submitState = await withCdpUiLock(async () => {
+            await ensureAppCdpReady();
+            const sendStartMs = Date.now();
+            const prevActiveInfo = await getActiveThreadInfo(CDP_PORT, explicitTargetId).catch(() => null);
+            let targetConvId = binding?.conversationId || null;
+            let startedFreshChat = false;
+
+            if (binding?.conversationId) {
+                if (!prevActiveInfo || prevActiveInfo.id !== binding.conversationId) {
+                    await switchAgentThread(CDP_PORT, binding.title || '', binding.workspace || null, binding.conversationId).catch(() => {});
+                }
+            } else if (explicitThreadName) {
+                await switchAgentThread(CDP_PORT, explicitThreadName).catch(() => {});
+                const switched = await getActiveThreadInfo(CDP_PORT, explicitTargetId).catch(() => null);
+                targetConvId = switched?.id || null;
+            } else if (msgThreadId && hasBotTopicsEnabled(ctx)) {
+                // Unbound Telegram topic (e.g. user tapped "New Chat" in Telegram top bar and sent a prompt)
+                await triggerNewChat(CDP_PORT).catch(() => {});
+                await new Promise(r => setTimeout(r, 600));
+                targetConvId = null;
+                startedFreshChat = true;
+            } else {
+                targetConvId = prevActiveInfo?.id || getLastResolvedThreadId() || null;
+            }
+
+            let baselineBytes = targetConvId ? getTranscriptSize(targetConvId) : 0;
+            const sendResult = await sendViaCDPWithRecovery(query, explicitTargetId);
+            let resolvedTargetId = typeof sendResult === 'string'
+                ? sendResult
+                : (sendResult?.targetId || explicitTargetId || null);
+
+            if (resolvedTargetId === 'INVALID_MODAL_OPTION') {
+                return { invalidModal: true };
+            }
+
+            await new Promise(r => setTimeout(r, 500));
+
+            if (!targetConvId) {
+                const resolved = await resolveActiveConversationAfterSend(CDP_PORT, resolvedTargetId, {
+                    excludeConversationId: startedFreshChat ? (prevActiveInfo?.id || null) : null,
+                    sinceMs: sendStartMs - 1000,
+                    waitMs: 7000
+                });
+                if (resolved?.conversationId) {
+                    targetConvId = resolved.conversationId;
+                    baselineBytes = startedFreshChat ? 0 : baselineBytes;
+                }
+            } else {
+                await snapshotChatState(CDP_PORT, resolvedTargetId).catch(() => {});
+            }
+
+            const curInfo = await getActiveThreadInfo(CDP_PORT, resolvedTargetId).catch(() => null);
+            if (msgThreadId && chatId && targetConvId) {
+                const resolvedTitle = (curInfo && curInfo.id === targetConvId ? curInfo.name : '') || binding?.title || query.replace(/\s+/g, ' ').trim().slice(0, 60);
+                const resolvedWs = (curInfo && curInfo.id === targetConvId ? curInfo.workspace : '') || binding?.workspace || '';
+                binding = topicRouter.bindTopic(chatId, msgThreadId, {
+                    conversationId: targetConvId,
+                    title: resolvedTitle,
+                    workspace: resolvedWs
+                });
+            }
+
+            if (targetConvId) {
+                registerWatchedConversation(targetConvId);
+                if (global.__taskWatcher) {
+                    global.__taskWatcher.setConversationBusy(targetConvId, true);
+                }
+            } else {
+                isAgentBusy = true;
+                if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
+            }
+
+            return {
+                invalidModal: false,
+                targetId: resolvedTargetId,
+                targetConvId,
+                baselineBytes,
+                startedFreshChat
+            };
+        });
+
+        if (submitState.invalidModal) {
+            return await ctx.reply(t('error.modal_active') || 'A modal is currently active in the IDE. Please select a valid option or dismiss it before sending a message.');
         }
-        return;
-    }
 
-    setReaction(ctx, REACTION.THINKING).catch(() => {});
+        const { targetId, targetConvId, baselineBytes, startedFreshChat } = submitState;
 
-    // Fire-and-forget: don't block Telegraf's update loop so other commands remain responsive
-    (async () => {
+        // Phase 2: Outside UI lock, watch this conversation's transcript until final response
         try {
-            if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
-            let targetId = explicitTargetId;
-            let text = "";
-            let interactiveButtons = null;
+            const waitRes = await waitForConversationResponse(
+                CDP_PORT,
+                targetConvId,
+                450000,
+                createProgressHandler(ctx),
+                targetId,
+                baselineBytes
+            );
 
-            isAgentBusy = true;
-            if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
-            try {
-                const result = await sendViaCDPWithRecovery(query, explicitTargetId);
-                if (typeof result === 'string') {
-                    targetId = result;
-                } else if (result && result.targetId) {
-                    targetId = result.targetId;
-                } else {
-                    targetId = explicitTargetId || targetId;
-                }
-                
-                if (targetId === "INVALID_MODAL_OPTION") {
-                    return await ctx.reply(t('error.modal_active') || 'A modal is currently active in the IDE. Please select a valid option or dismiss it before sending a message.');
-                }
-                setReaction(ctx, REACTION.THINKING).catch(() => {});
+            if (!waitRes.done) {
+                return await ctx.reply(t('ask.timeout'));
+            }
 
-                // Wait briefly for message to render in DOM before anchoring state
-                await new Promise(r => setTimeout(r, 500));
-                await snapshotChatState(CDP_PORT, targetId).catch(() => {});
-                
-                const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
-                if (isDone) {
-                    await new Promise(r => setTimeout(r, 500));
-                    let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, explicitThreadName);
-                    text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
-                    interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
-                    
-                    text = stripQueryFromResponse(text, query);
-                } else {
-                    return await ctx.reply(t('ask.timeout'));
-                }
+            await new Promise(r => setTimeout(r, 400));
+            const _latestRes = await getConversationLatestResponse(
+                CDP_PORT,
+                targetConvId,
+                targetId,
+                binding?.title || explicitThreadName,
+                false,
+                Boolean(waitRes.emittedProgress)
+            );
+            let text = typeof _latestRes === 'string' ? _latestRes : (_latestRes?.text || '');
+            const interactiveButtons = typeof _latestRes === 'string' ? null : (_latestRes?.buttons || null);
 
-                if (!text) text = t('ask.done_empty');
-                const header = await getChatHeader(targetId, t('ask.done'));
-                const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
-                
-                const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.message.message_id);
-                if (sentIds && sentIds.length > 0 && targetId) {
-                    const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
-                    const currentThreadName = activeInfo ? activeInfo.name : null;
-                    sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
-                    saveMessageTargetMap(messageTargetMap);
+            if ((!text || text === t('latest.not_found_active')) && waitRes.finalText) {
+                text = waitRes.finalText;
+            }
+
+            text = stripQueryFromResponse(text, query);
+            if (originalCaption) {
+                text = stripQueryFromResponse(text, originalCaption);
+            }
+            if (!text) text = waitRes.finalText || t('ask.done_empty');
+
+            // Refresh conversation title if Antigravity generated a clean title for a newly created chat
+            let headerMeta = binding ? { title: binding.title, workspace: binding.workspace } : null;
+            if (targetConvId) {
+                const latestInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
+                if (latestInfo && latestInfo.id === targetConvId && latestInfo.name) {
+                    topicRouter.updateConversationMeta(targetConvId, {
+                        title: latestInfo.name,
+                        workspace: latestInfo.workspace
+                    });
+                    headerMeta = { title: latestInfo.name, workspace: latestInfo.workspace || headerMeta?.workspace || '' };
+                    if (startedFreshChat && msgThreadId && chatId) {
+                        await renameTelegramTopic(chatId, msgThreadId, topicRouter.formatTopicTitle(latestInfo.name, latestInfo.workspace));
+                    }
                 }
-            } finally {
+            }
+
+            setReaction(ctx, null).catch(() => {});
+            const header = await getChatHeader(targetId, t('ask.done'), headerMeta, Boolean(msgThreadId));
+            const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(headerMeta?.title || null, headerMeta?.workspace || null, targetId);
+
+            const sentIds = await sendBotMessage(ctx, text, header, buttons, replyToMsgId);
+            if (sentIds && sentIds.length > 0 && targetId) {
+                const currentThreadName = headerMeta?.title || explicitThreadName || null;
+                sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName, conversationId: targetConvId }));
+                saveMessageTargetMap(messageTargetMap);
+            }
+        } finally {
+            if (targetConvId) {
+                if (global.__taskWatcher) {
+                    global.__taskWatcher.setConversationBusy(targetConvId, false);
+                }
+            } else {
                 isAgentBusy = false;
                 if (global.__taskWatcher) {
                     global.__taskWatcher.setBusy(false);
                     global.__taskWatcher.syncBaseline();
                 }
             }
-        } catch(err) {
-            isAgentBusy = false;
-            if (global.__taskWatcher) {
-                global.__taskWatcher.setBusy(false);
-                global.__taskWatcher.syncBaseline();
-            }
-            const errorMsg = err.message === 'no_chat_input' ? t('ask.no_chat_input') : err.message;
-            ctx.reply(t('ask.headless_error', { error: errorMsg })).catch(() => {});
         }
-    })();
-});
+    }
+
+    bot.on('text', async (ctx, next) => {
+        const firstWord = ctx.message.text.split(/[\s@]+/)[0].replace(/^\//, '').toLowerCase();
+        if (ctx.message.text.startsWith('/') && KNOWN_BOT_COMMANDS.has(firstWord)) {
+            return next();
+        }
+        let query = ctx.message.text;
+
+        let explicitTargetId = null;
+        let explicitThreadName = null;
+        if (ctx.message.reply_to_message && !ctx.message.reply_to_message.forum_topic_created) {
+            const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
+            if (typeof val === 'string') explicitTargetId = val;
+            else if (val) { explicitTargetId = val.targetId; explicitThreadName = val.threadName; }
+
+            query = extractQuotedContext(ctx) + query;
+        }
+        if (!explicitTargetId && ctx.message.reply_to_message?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('focus_')) {
+            explicitTargetId = ctx.message.reply_to_message.reply_markup.inline_keyboard[0][0].callback_data.replace('focus_', '');
+        }
+
+        // Fire-and-forget: don't block Telegraf's update loop so other topics and commands remain responsive
+        (async () => {
+            try {
+                await executeTopicAwarePrompt(ctx, query, {
+                    explicitTargetId,
+                    explicitThreadName,
+                    replyToMsgId: ctx.message.message_id
+                });
+            } catch (err) {
+                setReaction(ctx, null).catch(() => {});
+                const errorMsg = err.message === 'no_chat_input' ? t('ask.no_chat_input') : err.message;
+                ctx.reply(t('ask.headless_error', { error: errorMsg })).catch(() => {});
+            }
+        })();
+    });
 
 // ===== PHOTO & DOCUMENT HANDLER =====
 
 const mediaGroupCache = new Map();
 
 async function processAgentRequest(ctx, query, explicitTargetId, explicitThreadName, originalCaption) {
-    isAgentBusy = true;
-    if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
-    try {
-        setReaction(ctx, REACTION.THINKING).catch(() => {});
-        if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
-        const result = await sendViaCDPWithRecovery(query, explicitTargetId);
-        let targetId = typeof result === 'string' ? result : (result?.targetId || explicitTargetId);
-        
-        if (targetId === "INVALID_MODAL_OPTION") {
-            ctx.reply(t('error.modal_active'));
-            return;
-        }
-
-        // Wait briefly for message to render in DOM before anchoring state
-        await new Promise(r => setTimeout(r, 500));
-        await snapshotChatState(CDP_PORT, targetId).catch(() => {});
-        
-        const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
-        if (isDone) {
-            await new Promise(r => setTimeout(r, 500));
-            let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, null, false);
-            let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
-            let interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
-            
-            text = stripQueryFromResponse(text, query);
-            if (originalCaption) {
-                text = stripQueryFromResponse(text, originalCaption);
-            }
-            if (!text) text = t('ask.done_empty');
-            const header = await getChatHeader(targetId, t('ask.done'));
-            
-            const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
-            
-            const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.message.message_id);
-            if (sentIds && sentIds.length > 0 && targetId) {
-                const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
-                const currentThreadName = activeInfo ? activeInfo.name : null;
-                sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
-                saveMessageTargetMap(messageTargetMap);
-            }
-        } else {
-            await ctx.reply(t('ask.timeout'));
-        }
-    } finally {
-        isAgentBusy = false;
-        if (global.__taskWatcher) {
-            global.__taskWatcher.setBusy(false);
-            global.__taskWatcher.syncBaseline();
-        }
-    }
+    await executeTopicAwarePrompt(ctx, query, {
+        explicitTargetId,
+        explicitThreadName,
+        originalCaption,
+        replyToMsgId: ctx.message?.message_id || null
+    });
 }
 
 async function processMediaGroup(group) {
@@ -5179,7 +5494,9 @@ async function init() {
         onNotification: async ({ conversationId, text, type }) => {
             console.log(`[TaskWatcher] 📬 Proactive notification (${type}, conv: ${conversationId?.substring(0, 8)}, ${text.length} chars)`);
 
-            const header = '🔔 <b>' + t('task_watcher.proactive_msg') + '</b>\n\n';
+            const header = type === 'agent_progress'
+                ? '⏳ <b>进度更新</b>\n\n'
+                : ('🔔 <b>' + t('task_watcher.proactive_msg') + '</b>\n\n');
             const fullHtml = header + markdownToTelegramHtml(text);
             const chunks = splitTelegramHtmlChunks(fullHtml, 3500);
             if (chunks.length === 0) return;
@@ -5187,43 +5504,29 @@ async function init() {
 
             for (const chatId of ALLOWED_CHAT_IDS) {
                 try {
-                    const existing = proactiveMessageIds.get(chatId);
+                    let topicBinding = conversationId ? topicRouter.getTopicForConversation(chatId, conversationId) : null;
+                    let messageThreadId = topicBinding ? topicBinding.messageThreadId : undefined;
+                    const proactiveKey = `${chatId}:${messageThreadId || 'root'}:${conversationId || 'none'}`;
+                    const existing = proactiveMessageIds.get(proactiveKey);
                     const now = Date.now();
 
-                    // If we have a recent message and the notification fits in a single chunk, try to edit it
-                    // BUT: never overwrite a feedback message (with Proceed/Cancel) with a plain notification
-                    if (chunks.length === 1 && existing && (now - existing.timestamp) < PROACTIVE_RESET_MS) {
-                        if (existing.hasFeedback && !isFeedback) {
-                            console.log(`[TaskWatcher] Existing msg ${existing.messageId} has Proceed/Cancel buttons — sending new msg instead of overwriting`);
-                        } else {
-                            try {
-                                const opts = { parse_mode: 'HTML' };
-                                if (isFeedback) {
-                                    opts.reply_markup = {
-                                        inline_keyboard: [
-                                            [
-                                                { text: t('artifact_feedback.proceed') || '✅ Proceed', callback_data: `fb_proceed_${conversationId.substring(0,8)}` },
-                                                { text: t('artifact_feedback.cancel') || '❌ Cancel', callback_data: `fb_cancel_${conversationId.substring(0,8)}` }
-                                            ]
-                                        ]
-                                    };
-                                }
-                                await bot.telegram.editMessageText(
-                                    chatId, existing.messageId, null,
-                                    chunks[0], opts
-                                );
-                                existing.timestamp = now;
-                                existing.hasFeedback = isFeedback;
-                                console.log(`[TaskWatcher] Edited existing notification msg ${existing.messageId}`);
-                                continue;
-                            } catch (editErr) {
-                                console.log(`[TaskWatcher] Edit failed, sending new: ${editErr.message}`);
-                            }
+                    // Only edit in-place when both previous and current messages are transient progress updates
+                    if (type === 'agent_progress' && chunks.length === 1 && existing && existing.isProgress && (now - existing.timestamp) < PROACTIVE_RESET_MS) {
+                        try {
+                            await bot.telegram.editMessageText(
+                                chatId, existing.messageId, null,
+                                chunks[0], { parse_mode: 'HTML' }
+                            );
+                            existing.timestamp = now;
+                            console.log(`[TaskWatcher] Edited progress notification msg ${existing.messageId}`);
+                            continue;
+                        } catch (editErr) {
+                            console.log(`[TaskWatcher] Edit failed, sending new: ${editErr.message}`);
                         }
                     }
 
                     let replyMarkup = undefined;
-                    if (type === 'agent_proactive_feedback') {
+                    if (isFeedback) {
                         replyMarkup = {
                             inline_keyboard: [
                                 [
@@ -5234,21 +5537,39 @@ async function init() {
                         };
                     }
 
-                    // Send all chunks sequentially
+                    // Send all chunks sequentially into the conversation's bound Telegram Topic
                     let lastSent = null;
                     for (let i = 0; i < chunks.length; i++) {
                         const isLast = i === chunks.length - 1;
                         const chunkContent = chunks[i];
+                        const buildOpts = (htmlMode) => {
+                            const o = {};
+                            if (htmlMode) o.parse_mode = 'HTML';
+                            if (messageThreadId) o.message_thread_id = messageThreadId;
+                            if (isLast && replyMarkup) o.reply_markup = replyMarkup;
+                            return o;
+                        };
                         try {
-                            const opts = { parse_mode: 'HTML' };
-                            if (isLast && replyMarkup) opts.reply_markup = replyMarkup;
-                            lastSent = await bot.telegram.sendMessage(chatId, chunkContent, opts);
+                            lastSent = await bot.telegram.sendMessage(chatId, chunkContent, buildOpts(true));
                         } catch (err) {
-                            if (err.message.includes("parse entities")) {
+                            if (messageThreadId && isDeletedTopicError(err)) {
+                                topicRouter.unbindTopic(chatId, messageThreadId);
+                                const recreated = await createTelegramTopic(
+                                    chatId,
+                                    topicRouter.formatTopicTitle(topicBinding?.title || conversationId?.slice(0, 8), topicBinding?.workspace || '')
+                                ).catch(() => null);
+                                messageThreadId = recreated || undefined;
+                                if (recreated && conversationId) {
+                                    topicRouter.bindTopic(chatId, recreated, {
+                                        conversationId,
+                                        title: topicBinding?.title || '',
+                                        workspace: topicBinding?.workspace || ''
+                                    });
+                                }
+                                lastSent = await bot.telegram.sendMessage(chatId, chunkContent, buildOpts(true));
+                            } else if (err.message.includes('parse entities')) {
                                 const plain = chunkContent.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
-                                const opts = {};
-                                if (isLast && replyMarkup) opts.reply_markup = replyMarkup;
-                                lastSent = await bot.telegram.sendMessage(chatId, plain, opts);
+                                lastSent = await bot.telegram.sendMessage(chatId, plain, buildOpts(false));
                                 console.log(`[TaskWatcher] Sent plain text fallback ${lastSent.message_id}`);
                             } else {
                                 throw err;
@@ -5256,8 +5577,13 @@ async function init() {
                         }
                     }
                     if (lastSent) {
-                        proactiveMessageIds.set(chatId, { messageId: lastSent.message_id, timestamp: now, hasFeedback: isFeedback });
-                        console.log(`[TaskWatcher] Sent notification (${chunks.length} chunk(s)), last msg ${lastSent.message_id}`);
+                        proactiveMessageIds.set(proactiveKey, {
+                            messageId: lastSent.message_id,
+                            timestamp: now,
+                            hasFeedback: isFeedback,
+                            isProgress: type === 'agent_progress'
+                        });
+                        console.log(`[TaskWatcher] Sent notification (${chunks.length} chunk(s), thread=${messageThreadId || 'root'}), last msg ${lastSent.message_id}`);
                     }
                 } catch (e) {
                     console.error('[TaskWatcher] Failed to send notification:', e.message);
@@ -5275,9 +5601,14 @@ async function init() {
     // Expose taskWatcher globally so text handler can set busy/idle
     global.__taskWatcher = taskWatcher;
 
-    // Start watching the current active/last resolved thread immediately upon bot startup
+    // Start watching all bound topic conversations + current active thread immediately upon bot startup
+    for (const boundConvId of topicRouter.getAllBoundConversationIds()) {
+        taskWatcher.watchConversation(boundConvId);
+        watchArtifacts(boundConvId);
+    }
     const initialThreadId = getLastResolvedThreadId();
     if (initialThreadId) {
+        taskWatcher.setActiveConversation(initialThreadId);
         watchArtifacts(initialThreadId);
     }
 }
