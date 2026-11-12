@@ -105,7 +105,8 @@ const threadNameToIdCache = new Map();
 function findConversationIdByTitle(threadName) {
     if (!threadName) return null;
 
-    const isStandalone = DriverFactory.getDriver().appType === 'standalone';
+    const appType = DriverFactory.getDriver().appType;
+    const isStandalone = appType === 'agent' || appType === 'standalone';
 
     if (isStandalone && threadNameToIdCache.has(threadName)) {
         return threadNameToIdCache.get(threadName);
@@ -623,7 +624,12 @@ function httpGet(url, timeoutMs = 5000) {
         const req = http.get(url, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
-            res.on('end', () => resolve(data));
+            res.on('end', () => {
+                if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+                    return reject(new Error(`HTTP ${res.statusCode} from ${url}`));
+                }
+                resolve(data);
+            });
         }).on('error', err => reject(err));
         
         req.setTimeout(timeoutMs, () => {

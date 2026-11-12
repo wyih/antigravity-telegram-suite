@@ -290,9 +290,13 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-function getCDPPort(app = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') {
+function getCDPPort(app = config.preferredApp || 'agent') {
     if (app === 'ide') {
         return parseInt(process.env.IDE_CDP_PORT || '9334', 10);
+    }
+    const explicitPort = parseInt(process.env.AGENT_CDP_PORT || process.env.DEBUGGING_PORT || '', 10);
+    if (explicitPort && !isNaN(explicitPort)) {
+        return explicitPort;
     }
     try {
         const devToolsFile = path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort');
@@ -302,7 +306,7 @@ function getCDPPort(app = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') {
             if (p && !isNaN(p)) return p;
         }
     } catch (_) {}
-    return parseInt(process.env.AGENT_CDP_PORT || process.env.DEBUGGING_PORT || '9333', 10);
+    return 9333;
 }
 let CDP_PORT = getCDPPort();
 
@@ -5049,7 +5053,9 @@ bot.on(['photo', 'document', 'voice', 'audio'], (ctx) => {
 async function init() {
     console.log("Starting initialization...");
     try {
-        await telegraphPublisher.init();
+        if (telegraphPublisher.isTelegraphEnabled()) {
+            await telegraphPublisher.init();
+        }
         await clearAllMenuScopes();
         await setMenuOnAllScopes();
         console.log("Menu commands set.");
@@ -5122,7 +5128,7 @@ async function init() {
     updater.startUpdateChecker(bot, ALLOWED_CHAT_IDS);
 
     // Initialize Task Watcher — monitors agent's proactive notifications
-    const preferredApp = (process.env.ANTIGRAVITY_PREFERRED_APP || 'ide').toLowerCase();
+    const preferredApp = (config.preferredApp || 'agent').toLowerCase();
     const appDataName = preferredApp === 'agent' ? 'antigravity' : 'antigravity-ide';
     
     // Track last proactive notification message per chat for edit-in-place

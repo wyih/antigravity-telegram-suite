@@ -111,6 +111,9 @@ async function makeRequestWithRetry(endpoint, payload, maxRetries = 3) {
 
 // 1. Account registration and token persistence
 async function init() {
+    if (!isTelegraphEnabled()) {
+        return;
+    }
     try {
         const tDir = getTelegraphDir();
         if (!fs.existsSync(tDir)) {

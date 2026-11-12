@@ -7,14 +7,30 @@ function wait(ms) {
 
 function isConnectionRefusedError(err) {
     const text = `${err && err.code ? err.code : ''} ${err && err.message ? err.message : ''}`;
-    return text.includes('ECONNREFUSED') || text.includes('actively refused');
+    return (
+        text.includes('ECONNREFUSED') ||
+        text.includes('actively refused') ||
+        text.includes('HTTP 404')
+    );
 }
 
 function isCdpReachable(port, timeoutMs = 2000) {
     return new Promise(resolve => {
         const req = http.get(`http://127.0.0.1:${port}/json`, res => {
-            res.resume();
-            resolve(res.statusCode >= 200 && res.statusCode < 500);
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                res.resume();
+                return resolve(false);
+            }
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', chunk => { body += chunk; });
+            res.on('end', () => {
+                try {
+                    resolve(Array.isArray(JSON.parse(body)));
+                } catch (_) {
+                    resolve(false);
+                }
+            });
         });
         req.setTimeout(timeoutMs, () => {
             req.destroy();
