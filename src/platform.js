@@ -451,19 +451,21 @@ function launchIDE(workspace, port = 9333, app = getPreferredApp()) {
                         : `start "" "${binary}" --remote-debugging-port=${port} ${dataDirArg} ${wsArg}`;
                     break;
                 case 'darwin':
-                    // Use the CLI script which handles IPC to correctly open new windows
-                    // in existing instances, unlike the raw MacOS binary.
-                    const macCli = `${binary}/Contents/Resources/app/bin/${app === 'ide' ? 'antigravity-ide' : 'antigravity'}`;
-                    let cliToUse = macCli;
-                    if (!fs.existsSync(cliToUse)) {
-                        cliToUse = `${binary}/Contents/Resources/app/bin/antigravity`;
+                    if (!isRunning) {
+                        cmd = `open -a "${binary}" --args --remote-debugging-port=${port} ${dataDirArg} ${wsArg}`;
+                    } else {
+                        // Use the CLI script when available so existing instances open a new window via IPC.
+                        const macCli = `${binary}/Contents/Resources/app/bin/${app === 'ide' ? 'antigravity-ide' : 'antigravity'}`;
+                        let cliToUse = macCli;
+                        if (!fs.existsSync(cliToUse)) {
+                            cliToUse = `${binary}/Contents/Resources/app/bin/antigravity`;
+                        }
+                        if (fs.existsSync(cliToUse)) {
+                            cmd = `nohup "${cliToUse}" ${dataDirArg} ${wsArg} > /dev/null 2>&1 &`;
+                        } else {
+                            cmd = `open -a "${binary}" --args ${dataDirArg} ${wsArg}`;
+                        }
                     }
-                    if (!fs.existsSync(cliToUse)) {
-                        cliToUse = `${binary}/Contents/MacOS/${app === 'ide' ? 'Antigravity IDE' : 'Antigravity'}`;
-                    }
-                    cmd = isRunning
-                        ? `nohup "${cliToUse}" ${dataDirArg} ${wsArg} > /dev/null 2>&1 &`
-                        : `nohup "${cliToUse}" --remote-debugging-port=${port} ${dataDirArg} ${wsArg} > /dev/null 2>&1 &`;
                     break;
                 default: // linux
                     if (isRunning) {
